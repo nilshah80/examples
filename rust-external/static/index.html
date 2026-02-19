@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Identity Service — External Client Example (Rust)</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Identity Service — External Client Example</h1>
+      <p class="subtitle">OAuth2 Token Flow with AES-256-GCM Encryption via Sidecar (HMAC Auth)</p>
+      <div class="client-info">
+        Auth: <code>HMAC-SHA256</code> &middot; Crypto: <code>Rust (server-side)</code> &middot; Sidecar: <code>ECDH + AES-256-GCM</code>
+      </div>
+    </header>
+    <main id="app"></main>
+  </div>
+
+  <script>
+    var STEPS = [
+      { n: 1, title: 'Session Init (Anonymous ECDH)', desc: 'Generate ECDH P-256 keypair on the Rust server, exchange public keys with sidecar, derive AES-256-GCM session key via HKDF-SHA256. Anonymous session TTL: 30 minutes.', btn: 'POST /api/v1/session/init', session: true },
+      { n: 2, title: 'Token Issue (HMAC-SHA256 + GCM)', desc: 'Rust server encrypts request body with AES-256-GCM and authenticates via <code>X-Signature: HMAC-SHA256(plaintext body)</code>. HMAC is computed over the plaintext body before encryption.', btn: 'POST /api/v1/token/issue' },
+      { n: 3, title: 'Token Introspection (Bearer + GCM)', desc: 'Verify the issued token is active and retrieve its claims. From this step onward, external clients use <code>Authorization: Bearer</code> (same as internal).', btn: 'POST /api/v1/introspect' },
+      { n: 4, title: 'Session Refresh (Authenticated)', desc: 'Create a new ECDH session with <code>Authorization: Bearer</code> + <code>X-Subject</code>. Authenticated session TTL: 1 hour. Old session key is zeroized.', btn: 'POST /api/v1/session/init', session: true },
+      { n: 5, title: 'Token Refresh (Bearer + GCM)', desc: 'Rotate tokens using the refresh token. Uses the new authenticated session.', btn: 'POST /api/v1/token' },
+      { n: 6, title: 'Token Revocation (Bearer + GCM)', desc: 'Revoke the refresh token — this revokes the entire token family. RFC 7009 compliant.', btn: 'POST /api/v1/revoke' },
+    ];
+
+    var currentStep = 1;
+    var loading = false;
+    var stepResults = {};
+
+    async function runStep(n) {
+      loading = true;
+      render();
+      try {
+        var res = await fetch('/steps/' + n, { method: 'POST' });
+        stepResults[n] = await res.json();
+        if (stepResults[n].success) currentStep = n + 1;
+      } catch (e) {
+        stepResults[n] = { success: false, error: e.message };
+      }
+      loading = false;
+      render();
+    }
+
+    async function resetAll() {
+      await fetch('/steps/reset', { method: 'POST' });
+      currentStep = 1;
+      stepResults = {};
+      render();
+    }
+
+    function fmtJson(s) {
+      try { return JSON.stringify(JSON.parse(s), null, 2); } catch (e) { return s; }
+    }
+
+    function esc(s) {
+      var d = document.createElement('div');
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    function renderSession(r) {
+      if (!r) return '';
+      var h = '<div class="result-box ' + (r.success ? 'success' : 'error') + '">';
+      h += '<div class="result-header"><h4>' + (r.success ? 'Success' : 'Failed') + '</h4>';
+      h += '<span class="duration">' + (r.durationMs || 0) + 'ms</span></div>';
+      if (r.error) h += '<div class="error-text">' + esc(r.error) + '</div>';
+      if (r.sessionId) {
+        h += '<div class="kv"><span>Session ID</span><code>' + esc(r.sessionId) + '</code></div>';
+        h += '<div class="kv"><span>Key ID (kid)</span><code>' + esc(r.kid) + '</code></div>';
+        h += '<div class="kv"><span>Authenticated</span><code>' + r.authenticated + '</code></div>';
+        h += '<div class="kv"><span>TTL</span><code>' + r.expiresInSec + 's</code></div>';
+      }
+      h += '</div>';
+      return h;
+    }
+
+    function renderStep(r) {
+      if (!r) return '';
+      var h = '<div class="result-box ' + (r.success ? 'success' : 'error') + '">';
+      h += '<div class="result-header"><h4>' + (r.success ? 'Success' : 'Failed') + '</h4>';
+      h += '<span class="duration">' + (r.durationMs || 0) + 'ms</span></div>';
+      if (r.error) h += '<div class="error-text">' + esc(r.error) + '</div>';
+      if (r.requestHeaders) h += '<details><summary>Request Headers</summary><pre>' + esc(fmtJson(JSON.stringify(r.requestHeaders))) + '</pre></details>';
+      if (r.requestBodyPlaintext) h += '<details><summary>Request Body (plaintext)</summary><pre>' + esc(fmtJson(r.requestBodyPlaintext)) + '</pre></details>';
+      if (r.requestBodyEncrypted) h += '<details><summary>Request Body (encrypted)</summary><pre>' + esc(r.requestBodyEncrypted) + '</pre></details>';
+      if (r.responseBodyEncrypted) h += '<details><summary>Response Body (encrypted)</summary><pre>' + esc(r.responseBodyEncrypted) + '</pre></details>';
+      if (r.responseBodyDecrypted) h += '<details open><summary>Response Body (decrypted)</summary><pre>' + esc(fmtJson(r.responseBodyDecrypted)) + '</pre></details>';
+      if (r.responseHeaders) h += '<details><summary>Response Headers</summary><pre>' + esc(fmtJson(JSON.stringify(r.responseHeaders))) + '</pre></details>';
+      h += '</div>';
+      return h;
+    }
+
+    function render() {
+      var app = document.getElementById('app');
+      var html = '';
+
+      STEPS.forEach(function (s) {
+        var isActive = currentStep === s.n;
+        var isDone = currentStep > s.n;
+        var cls = isActive ? 'active' : isDone ? 'done' : '';
+        var status = isDone ? 'Done' : isActive ? 'Ready' : 'Waiting';
+        var disabled = loading || !isActive;
+
+        html += '<section class="step-card ' + cls + '">';
+        html += '<div class="step-header"><span class="step-badge">' + s.n + '</span><h2>' + s.title + '</h2><span class="step-status">' + status + '</span></div>';
+        html += '<p class="step-desc">' + s.desc + '</p>';
+        html += '<button class="btn primary" onclick="runStep(' + s.n + ')" ' + (disabled ? 'disabled' : '') + '>' + (loading && isActive ? 'Processing...' : s.btn) + '</button>';
+
+        if (stepResults[s.n]) {
+          html += s.session ? renderSession(stepResults[s.n]) : renderStep(stepResults[s.n]);
+        }
+
+        html += '</section>';
+      });
+
+      if (currentStep > 6) {
+        html += '<div class="complete-card"><h2>Journey Complete</h2><p>All 6 steps executed successfully. <button class="btn-link" onclick="resetAll()">Reset and start over</button>.</p></div>';
+      }
+
+      app.innerHTML = html;
+    }
+
+    render();
+  </script>
+</body>
+</html>
