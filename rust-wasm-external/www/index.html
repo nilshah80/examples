@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Identity Service — Rust WASM External Client</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      background: #0a0e27;
+      color: #e0e6ed;
+      line-height: 1.6;
+    }
+    .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+    header {
+      text-align: center;
+      padding: 2rem 0;
+      border-bottom: 2px solid #1e2a4a;
+      margin-bottom: 2rem;
+    }
+    h1 {
+      font-size: 2rem;
+      color: #60a5fa;
+      margin-bottom: 0.5rem;
+    }
+    .subtitle { color: #94a3b8; font-size: 0.95rem; margin-bottom: 1rem; }
+    .info-box {
+      background: #1e293b;
+      padding: 1rem;
+      border-radius: 8px;
+      border-left: 4px solid #60a5fa;
+      margin-bottom: 2rem;
+      font-size: 0.9rem;
+    }
+    .info-box strong { color: #60a5fa; }
+    .steps { display: flex; flex-direction: column; gap: 1rem; }
+    .step {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 1.5rem;
+      transition: all 0.3s;
+    }
+    .step:hover { border-color: #60a5fa; }
+    .step-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1rem;
+    }
+    .step-title { font-size: 1.1rem; font-weight: 600; color: #60a5fa; }
+    .step-desc { color: #94a3b8; font-size: 0.9rem; margin-bottom: 1rem; }
+    .step-actions { display: flex; gap: 0.5rem; align-items: center; }
+    button {
+      background: #3b82f6;
+      color: white;
+      border: none;
+      padding: 0.6rem 1.2rem;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 500;
+      transition: all 0.2s;
+    }
+    button:hover { background: #2563eb; }
+    button:disabled {
+      background: #475569;
+      cursor: not-allowed;
+      opacity: 0.5;
+    }
+    button.reset {
+      background: #ef4444;
+    }
+    button.reset:hover { background: #dc2626; }
+    .result {
+      margin-top: 1rem;
+      padding: 1rem;
+      border-radius: 6px;
+      font-size: 0.85rem;
+    }
+    .result.success {
+      background: #10b98120;
+      border: 1px solid #10b981;
+    }
+    .result.error {
+      background: #ef444420;
+      border: 1px solid #ef4444;
+    }
+    .result-header {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 0.5rem;
+      font-weight: 600;
+    }
+    .result-header .success-text { color: #10b981; }
+    .result-header .error-text { color: #ef4444; }
+    .kv {
+      display: flex;
+      justify-content: space-between;
+      padding: 0.3rem 0;
+      border-bottom: 1px solid #334155;
+    }
+    .kv:last-child { border-bottom: none; }
+    .kv span { color: #94a3b8; }
+    code {
+      background: #0f172a;
+      padding: 0.2rem 0.4rem;
+      border-radius: 3px;
+      font-family: 'Courier New', monospace;
+      color: #60a5fa;
+      font-size: 0.85rem;
+    }
+    pre {
+      background: #0f172a;
+      padding: 1rem;
+      border-radius: 6px;
+      overflow-x: auto;
+      font-size: 0.8rem;
+      margin-top: 0.5rem;
+    }
+    details {
+      margin-top: 0.5rem;
+      cursor: pointer;
+    }
+    summary {
+      font-weight: 600;
+      color: #60a5fa;
+      padding: 0.3rem 0;
+      user-select: none;
+    }
+    summary:hover { color: #93c5fd; }
+    .storage-info {
+      background: #1e293b;
+      border: 1px solid #fbbf24;
+      border-left: 4px solid #fbbf24;
+      padding: 1rem;
+      border-radius: 6px;
+      margin: 1rem 0;
+      font-size: 0.9rem;
+    }
+    .storage-info h3 {
+      color: #fbbf24;
+      margin-bottom: 0.5rem;
+    }
+    .spinner {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid #ffffff50;
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+      margin-left: 0.5rem;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🦀 Identity Service — Rust WASM External Client</h1>
+      <p class="subtitle">OAuth2 Token Flow with HMAC-SHA256 + AES-256-GCM in WebAssembly</p>
+    </header>
+
+    <div class="info-box">
+      <strong>🔐 External Client with HMAC:</strong> This example uses <strong>HMAC-SHA256 signature</strong> for authentication (Step 2 only). A <strong>static encryption key embedded in WASM</strong> encrypts the session key before storing it in sessionStorage. JavaScript and browser dev tools can only see the <strong>encrypted session key</strong>, never the plaintext. All cryptographic operations (ECDH, HKDF, AES-GCM, HMAC) run inside the WASM module.
+    </div>
+
+    <div class="storage-info">
+      <h3>📦 Storage Strategy</h3>
+      <p>
+        <strong>sessionStorage</strong> is used (better than localStorage) because:
+      </p>
+      <ul style="margin-left: 1.5rem; margin-top: 0.5rem; color: #94a3b8;">
+        <li>Cleared when browser tab closes (more secure)</li>
+        <li>Not shared across tabs (isolation)</li>
+        <li>Perfect for temporary session data</li>
+      </ul>
+      <p style="margin-top: 0.5rem; color: #94a3b8;">
+        The session key is <strong>encrypted with WASM_STORAGE_KEY</strong> before being saved, ensuring the browser never sees the plaintext key.
+      </p>
+    </div>
+
+    <div id="app">
+      <div class="steps">
+        <!-- Steps will be rendered here -->
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

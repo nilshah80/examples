@@ -3,14 +3,17 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use p256::ecdh::EphemeralSecret;
 use p256::elliptic_curve::rand_core::OsRng;
 use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use p256::{EncodedPoint, PublicKey};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 use web_sys::{window, Storage};
+
+type HmacSha256 = Hmac<Sha256>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // BUILD-TIME CONFIGURATION
@@ -19,7 +22,7 @@ use web_sys::{window, Storage};
 
 const SIDECAR_URL: &str = match option_env!("WASM_SIDECAR_URL") {
     Some(url) => url,
-    None => "http://localhost:3508", // Default fallback
+    None => "http://localhost:3509", // Default fallback
 };
 
 const CLIENT_ID: &str = match option_env!("CLIENT_ID") {
@@ -457,6 +460,57 @@ pub fn generate_nonce() -> String {
 pub fn generate_timestamp() -> String {
     let date = js_sys::Date::new_0();
     date.to_iso_string().as_string().unwrap()
+}
+
+/// Compute HMAC-SHA256 signature for external client authentication
+///
+/// This function is ONLY used for Step 2 (Token Issue) in external clients.
+///
+/// Algorithm:
+/// 1. Compute SHA-256 hash of plaintext body (hex-encoded lowercase)
+/// 2. Build string-to-sign: METHOD\nPATH\nTIMESTAMP\nNONCE\nBODY_HASH
+/// 3. Compute HMAC-SHA256(client_secret, string-to-sign)
+/// 4. Return hex-encoded lowercase signature
+///
+/// # Arguments
+/// * `method` - HTTP method in uppercase (e.g., "POST")
+/// * `path` - API path (e.g., "/api/v1/token/issue")
+/// * `timestamp` - Unix timestamp in milliseconds as string
+/// * `nonce` - UUID v4 string
+/// * `body` - Plaintext request body (BEFORE encryption)
+/// * `secret` - Client secret from config
+///
+/// # Returns
+/// Hex-encoded lowercase HMAC-SHA256 signature (64 characters)
+#[wasm_bindgen]
+pub fn compute_hmac_signature(
+    method: &str,
+    path: &str,
+    timestamp: &str,
+    nonce: &str,
+    body: &str,
+    secret: &str,
+) -> String {
+    // Step 1: Compute SHA-256 hash of plaintext body
+    let body_hash = hex::encode(Sha256::digest(body.as_bytes()));
+
+    // Step 2: Build string-to-sign with newline separators
+    let string_to_sign = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        method.to_uppercase(),
+        path,
+        timestamp,
+        nonce,
+        body_hash
+    );
+
+    // Step 3: Compute HMAC-SHA256 signature
+    let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts any key length");
+    mac.update(string_to_sign.as_bytes());
+
+    // Step 4: Hex-encode the signature (lowercase)
+    hex::encode(mac.finalize().into_bytes())
 }
 
 /// Simple HTTP POST using fetch API

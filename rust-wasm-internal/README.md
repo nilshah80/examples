@@ -46,22 +46,21 @@ authenticated: "false"
 ```bash
 cd examples/rust-wasm-internal
 
-# 1. Configure (edit .env file)
-cp .env.example .env  # if needed
-vim .env              # set SIDECAR_URL, CLIENT_ID, etc.
+# 1. Configure (edit .env file if needed)
+# The .env file contains SIDECAR_URL, CLIENT_ID, CLIENT_SECRET, SUBJECT
 
 # 2. Build WASM module (injects .env values)
 ./build.sh
-# OR manually:
-source .env && wasm-pack build --target web --out-dir www/pkg
 
-# 3. Start local web server
-cd www
-python3 -m http.server 8080
+# 3. Start CORS proxy server (required for production sidecar)
+node proxy-server.js
+# This starts a proxy at http://localhost:8080 that forwards to the sidecar
 
 # 4. Open browser
 open http://localhost:8080
 ```
+
+**Note:** The proxy server is needed because browsers block direct requests to production sidecar URLs due to CORS policies. The proxy adds the necessary CORS headers.
 
 ### How Configuration Works
 

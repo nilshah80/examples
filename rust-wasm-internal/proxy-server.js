@@ -5,8 +5,20 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
-const PORT = 8080;
-const SIDECAR_URL = 'https://mutualfundbeta.abslmfbeta.com/portal/ipapi/uat/identity-sidecar';
+// Load configuration from .env file
+const envPath = path.join(__dirname, '.env');
+let REMOTE_SIDECAR_URL = 'https://mutualfundbeta.abslmfbeta.com/portal/ipapi/uat/identity-sidecar';
+
+if (fs.existsSync(envPath)) {
+  const envContent = fs.readFileSync(envPath, 'utf-8');
+  const remoteMatch = envContent.match(/REMOTE_SIDECAR_URL=(.+)/);
+  if (remoteMatch) {
+    REMOTE_SIDECAR_URL = remoteMatch[1].trim();
+  }
+}
+
+const PORT = 3508;
+const SIDECAR_URL = REMOTE_SIDECAR_URL;
 
 // Serve static files from www/
 const serveStatic = (req, res) => {
