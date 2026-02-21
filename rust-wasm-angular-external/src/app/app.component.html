@@ -1,0 +1,107 @@
+<div class="container">
+  <header>
+    <h1>{{ title }}</h1>
+    <p class="subtitle">OAuth2 Token Lifecycle with AES-256-GCM Encryption (WebAssembly)</p>
+    <div class="config-info" *ngIf="!loading && !error">
+      <p><strong>Client ID:</strong> {{ config.clientId }}</p>
+      <p><strong>Sidecar URL:</strong> {{ config.sidecarUrl }}</p>
+      <p><strong>Subject:</strong> {{ config.subject }}</p>
+    </div>
+  </header>
+
+  <div class="loading" *ngIf="loading">
+    <p>⏳ Loading WASM module...</p>
+  </div>
+
+  <div class="error" *ngIf="error">
+    <p>❌ {{ error }}</p>
+  </div>
+
+  <div class="main-content" *ngIf="!loading && !error">
+    <div class="steps-grid">
+      <div *ngFor="let step of steps" class="step-card">
+        <div class="step-header">
+          <span class="step-number">{{ step.n }}</span>
+          <h3>{{ step.title }}</h3>
+        </div>
+        <p class="step-desc">{{ step.desc }}</p>
+        <p class="step-endpoint"><code>{{ step.endpoint }}</code></p>
+        
+        <button
+          (click)="runStep(step.n)"
+          [disabled]="isStepDisabled(step.n)"
+          [class.running]="isStepRunning(step.n)"
+          class="run-btn">
+          {{ isStepRunning(step.n) ? '⏳ Running...' : '▶ Run Step ' + step.n }}
+        </button>
+
+        <div *ngIf="getResult(step.n) as result" class="result">
+          <div [class.success]="result.success" [class.failed]="!result.success" class="result-status">
+            <span *ngIf="result.success">✓ Success</span>
+            <span *ngIf="!result.success">✗ Failed</span>
+            <span class="duration">({{ result.durationMs }}ms)</span>
+          </div>
+
+          <div *ngIf="result.sessionId" class="result-section">
+            <h4>Session Info</h4>
+            <p><strong>Session ID:</strong> <code>{{ result.sessionId }}</code></p>
+            <p><strong>Kid:</strong> <code>{{ result.kid }}</code></p>
+            <p><strong>Authenticated:</strong> {{ result.authenticated ? 'Yes' : 'No' }}</p>
+            <p><strong>TTL:</strong> {{ result.expiresInSec }}s</p>
+          </div>
+
+          <div *ngIf="result.requestHeaders" class="result-section">
+            <h4>Request Headers</h4>
+            <pre>{{ formatHeaders(result.requestHeaders) }}</pre>
+          </div>
+
+          <div *ngIf="result.requestBodyPlaintext" class="result-section">
+            <h4>Request Body (Plaintext)</h4>
+            <pre>{{ formatJson(result.requestBodyPlaintext) }}</pre>
+          </div>
+
+          <div *ngIf="result.requestBodyEncrypted" class="result-section">
+            <h4>Request Body (Encrypted)</h4>
+            <pre class="encrypted">{{ result.requestBodyEncrypted }}</pre>
+          </div>
+
+          <div *ngIf="result.responseHeaders" class="result-section">
+            <h4>Response Headers</h4>
+            <pre>{{ formatHeaders(result.responseHeaders) }}</pre>
+          </div>
+
+          <div *ngIf="result.responseBodyEncrypted" class="result-section">
+            <h4>Response Body (Encrypted)</h4>
+            <pre class="encrypted">{{ result.responseBodyEncrypted }}</pre>
+          </div>
+
+          <div *ngIf="result.responseBodyDecrypted" class="result-section">
+            <h4>Response Body (Decrypted)</h4>
+            <pre>{{ formatJson(result.responseBodyDecrypted) }}</pre>
+          </div>
+
+          <div *ngIf="result.storageNote" class="result-section storage-note">
+            <p>{{ result.storageNote }}</p>
+          </div>
+
+          <div *ngIf="result.error" class="result-section error-section">
+            <h4>Error</h4>
+            <pre class="error-text">{{ result.error }}</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button (click)="reset()" class="reset-btn">🔄 Reset All</button>
+    </div>
+  </div>
+
+  <footer>
+    <p>
+      🔐 Session keys are encrypted with a static WASM key before storage<br>
+      📦 Crypto operations powered by <strong>Rust WebAssembly</strong><br>
+      🌐 Network payloads encrypted with <strong>AES-256-GCM</strong>
+    </p>
+  </footer>
+</div>
