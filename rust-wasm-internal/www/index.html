@@ -165,7 +165,7 @@
     </header>
 
     <div class="info-box">
-      <strong>🔐 Session Key Protection:</strong> This example uses a <strong>static encryption key embedded in WASM</strong> to encrypt the session key before storing it in sessionStorage. JavaScript and browser dev tools can only see the <strong>encrypted session key</strong>, never the plaintext. All cryptographic operations (ECDH, HKDF, AES-GCM) run inside the WASM module.
+      <strong>🔐 Session Key Protection:</strong> This example derives a <strong>unique per-session storage key</strong> at runtime using HKDF(WASM_STATIC_SECRET, session_id, client_id) to encrypt the session key before storing it in sessionStorage. JavaScript and browser dev tools can only see the <strong>encrypted session key</strong>, never the plaintext. Each session produces a different storage key, so extracting the WASM secret alone is insufficient. All cryptographic operations (ECDH, HKDF, AES-GCM) run inside the WASM module.
     </div>
 
     <div class="storage-info">
@@ -179,7 +179,7 @@
         <li>Perfect for temporary session data</li>
       </ul>
       <p style="margin-top: 0.5rem; color: #94a3b8;">
-        The session key is <strong>encrypted with WASM_STORAGE_KEY</strong> before being saved, ensuring the browser never sees the plaintext key.
+        The session key is <strong>encrypted with a per-session key derived via HKDF</strong> from the WASM-embedded secret and session_id, ensuring the browser never sees the plaintext key and each session has a unique storage encryption key.
       </p>
     </div>
 

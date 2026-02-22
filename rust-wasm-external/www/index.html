@@ -165,7 +165,7 @@
     </header>
 
     <div class="info-box">
-      <strong>🔐 External Client with HMAC:</strong> This example uses <strong>HMAC-SHA256 signature</strong> for authentication (Step 2 only). A <strong>static encryption key embedded in WASM</strong> encrypts the session key before storing it in sessionStorage. JavaScript and browser dev tools can only see the <strong>encrypted session key</strong>, never the plaintext. All cryptographic operations (ECDH, HKDF, AES-GCM, HMAC) run inside the WASM module.
+      <strong>🔐 External Client with HMAC:</strong> This example uses <strong>HMAC-SHA256 signature</strong> for authentication (Step 2 only). A <strong>unique per-session storage key</strong> is derived at runtime using HKDF(WASM_STATIC_SECRET, session_id, client_id) to encrypt the session key before storing it in sessionStorage. JavaScript and browser dev tools can only see the <strong>encrypted session key</strong>, never the plaintext. Each session produces a different storage key. All cryptographic operations (ECDH, HKDF, AES-GCM, HMAC) run inside the WASM module.
     </div>
 
     <div class="storage-info">
@@ -179,7 +179,7 @@
         <li>Perfect for temporary session data</li>
       </ul>
       <p style="margin-top: 0.5rem; color: #94a3b8;">
-        The session key is <strong>encrypted with WASM_STORAGE_KEY</strong> before being saved, ensuring the browser never sees the plaintext key.
+        The session key is <strong>encrypted with a per-session key derived via HKDF</strong> from the WASM-embedded secret and session_id, ensuring the browser never sees the plaintext key and each session has a unique storage encryption key.
       </p>
     </div>
 

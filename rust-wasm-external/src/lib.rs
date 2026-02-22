@@ -41,13 +41,14 @@ const SUBJECT: &str = match option_env!("SUBJECT") {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// STATIC WASM ENCRYPTION KEY
-// This key is embedded in WASM binary and used ONLY to encrypt/decrypt
-// the session key before storing in browser storage. This prevents the
-// browser/JavaScript from ever seeing the plaintext session key.
+// WASM STATIC SECRET
+// This secret is embedded in the WASM binary and combined with per-session
+// material (session_id, client_id) via HKDF to derive a unique storage
+// encryption key for each session. The static secret alone cannot decrypt
+// any stored session key — the session_id from sessionStorage is also needed.
 // ═══════════════════════════════════════════════════════════════════════════
 
-const WASM_STORAGE_KEY: [u8; 32] = [
+const WASM_STATIC_SECRET: [u8; 32] = [
     0x2a, 0x7b, 0x91, 0x4c, 0x65, 0xe8, 0x3f, 0xa9,
     0x1d, 0x52, 0xb3, 0x7e, 0x94, 0x0f, 0x6c, 0x28,
     0x83, 0xa4, 0x5d, 0x19, 0xf7, 0x2b, 0x68, 0x9a,
@@ -139,14 +140,15 @@ impl SessionContext {
     }
 
     /// Save encrypted session key to sessionStorage
-    /// The session key is encrypted with WASM_STORAGE_KEY before storing
+    /// The session key is encrypted with a per-session derived key before storing
     #[wasm_bindgen]
     pub fn save_to_storage(&self) -> Result<(), JsValue> {
         let storage = get_session_storage()?;
 
-        // Encrypt session key with static WASM key
-        let encrypted_session_key = encrypt_session_key_for_storage(&self.session_key)
-            .map_err(|e| JsValue::from_str(&e))?;
+        // Encrypt session key with per-session derived storage key
+        let encrypted_session_key =
+            encrypt_session_key_for_storage(&self.session_key, &self.session_id, &self.client_id)
+                .map_err(|e| JsValue::from_str(&e))?;
 
         // Store metadata and encrypted session key
         storage.set_item("session_id", &self.session_id)?;
@@ -156,7 +158,7 @@ impl SessionContext {
         storage.set_item("authenticated", &self.authenticated.to_string())?;
         storage.set_item("expires_in_sec", &self.expires_in_sec.to_string())?;
 
-        log("Session saved to storage (session key encrypted with WASM key)");
+        log("Session saved to storage (session key encrypted with per-session derived key)");
         Ok(())
     }
 
@@ -182,11 +184,12 @@ impl SessionContext {
             .parse::<i64>()
             .map_err(|_| JsValue::from_str("Invalid expires_in_sec value"))?;
 
-        // Decrypt session key using static WASM key
-        let session_key = decrypt_session_key_from_storage(&encrypted_session_key)
-            .map_err(|e| JsValue::from_str(&e))?;
+        // Decrypt session key using per-session derived storage key
+        let session_key =
+            decrypt_session_key_from_storage(&encrypted_session_key, &session_id, &client_id)
+                .map_err(|e| JsValue::from_str(&e))?;
 
-        log("Session loaded from storage (session key decrypted with WASM key)");
+        log("Session loaded from storage (session key decrypted with per-session derived key)");
 
         Ok(SessionContext {
             session_id,
@@ -386,11 +389,26 @@ fn build_aad(timestamp: &str, nonce: &str, kid: &str, client_id: &str) -> Vec<u8
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SESSION KEY STORAGE ENCRYPTION
-// Uses WASM_STORAGE_KEY to encrypt session key before storing in browser
+// Derives a per-session storage key via HKDF(WASM_STATIC_SECRET, session_id)
+// then uses it to encrypt the session key before storing in browser
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn encrypt_session_key_for_storage(session_key: &[u8; 32]) -> Result<String, String> {
-    let cipher = Aes256Gcm::new_from_slice(&WASM_STORAGE_KEY)
+fn derive_storage_key(session_id: &str, client_id: &str) -> Result<[u8; 32], String> {
+    let hk = Hkdf::<Sha256>::new(Some(session_id.as_bytes()), &WASM_STATIC_SECRET);
+    let info = format!("STORAGE|A256GCM|{}", client_id);
+    let mut storage_key = [0u8; 32];
+    hk.expand(info.as_bytes(), &mut storage_key)
+        .map_err(|e| format!("HKDF storage key derivation failed: {}", e))?;
+    Ok(storage_key)
+}
+
+fn encrypt_session_key_for_storage(
+    session_key: &[u8; 32],
+    session_id: &str,
+    client_id: &str,
+) -> Result<String, String> {
+    let storage_key = derive_storage_key(session_id, client_id)?;
+    let cipher = Aes256Gcm::new_from_slice(&storage_key)
         .map_err(|e| format!("Storage key error: {}", e))?;
 
     // Generate random 12-byte nonce
@@ -410,14 +428,19 @@ fn encrypt_session_key_for_storage(session_key: &[u8; 32]) -> Result<String, Str
     Ok(B64.encode(&result))
 }
 
-fn decrypt_session_key_from_storage(ciphertext_b64: &str) -> Result<[u8; 32], String> {
+fn decrypt_session_key_from_storage(
+    ciphertext_b64: &str,
+    session_id: &str,
+    client_id: &str,
+) -> Result<[u8; 32], String> {
     let encrypted = B64.decode(ciphertext_b64)
         .map_err(|e| format!("Base64 decode error: {}", e))?;
     if encrypted.len() < 28 {
         return Err("Encrypted session key too short".into());
     }
 
-    let cipher = Aes256Gcm::new_from_slice(&WASM_STORAGE_KEY)
+    let storage_key = derive_storage_key(session_id, client_id)?;
+    let cipher = Aes256Gcm::new_from_slice(&storage_key)
         .map_err(|e| format!("Storage key error: {}", e))?;
 
     let nonce = Nonce::from(<[u8; 12]>::try_from(&encrypted[..12]).unwrap());
