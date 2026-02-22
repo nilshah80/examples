@@ -191,3 +191,5 @@ go.sum
 *.pfx
 credentials.json
 secrets.json
+flutter-internal/.claude/settings.local.json
+.claude/settings.local.json

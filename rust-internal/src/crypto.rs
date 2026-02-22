@@ -96,7 +96,7 @@ pub fn encrypt(plaintext: &str, session_key: &[u8; 32], aad: &[u8]) -> Result<St
         Aes256Gcm::new_from_slice(session_key).map_err(|e| format!("AES key error: {e}"))?;
 
     let iv_bytes: [u8; 12] = rand::random();
-    let nonce = Nonce::from_slice(&iv_bytes);
+    let nonce = Nonce::from(iv_bytes);
 
     let payload = aes_gcm::aead::Payload {
         msg: plaintext.as_bytes(),
@@ -104,7 +104,7 @@ pub fn encrypt(plaintext: &str, session_key: &[u8; 32], aad: &[u8]) -> Result<St
     };
 
     let ciphertext_with_tag = cipher
-        .encrypt(nonce, payload)
+        .encrypt(&nonce, payload)
         .map_err(|e| format!("Encryption failed: {e}"))?;
 
     // Assemble: IV(12) || ciphertext || tag(16)
@@ -131,14 +131,14 @@ pub fn decrypt(
     let cipher =
         Aes256Gcm::new_from_slice(session_key).map_err(|e| format!("AES key error: {e}"))?;
 
-    let nonce = Nonce::from_slice(&encrypted[..12]);
+    let nonce = Nonce::from(<[u8; 12]>::try_from(&encrypted[..12]).unwrap());
     let payload = aes_gcm::aead::Payload {
         msg: &encrypted[12..],
         aad,
     };
 
     let plaintext = cipher
-        .decrypt(nonce, payload)
+        .decrypt(&nonce, payload)
         .map_err(|e| format!("Decryption failed: {e}"))?;
 
     String::from_utf8(plaintext).map_err(|e| format!("Invalid UTF-8: {e}"))

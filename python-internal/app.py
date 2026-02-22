@@ -290,9 +290,9 @@ if __name__ == "__main__":
         run_cli()
     else:
         print()
-        print("  Identity Service — Internal Client Example (Python)")
+        print("  Identity Service -- Internal Client Example (Python)")
         print(f"  Web UI:  http://localhost:{config.port}")
-        print("  API:     /steps/1..6 → Python crypto → Sidecar")
+        print("  API:     /steps/1..6 -> Python crypto -> Sidecar")
         print("  Auth:    Basic Auth")
         print()
         app.run(host="0.0.0.0", port=config.port, debug=False)

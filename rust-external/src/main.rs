@@ -340,8 +340,6 @@ async fn run_cli(config: Config) {
     const GREEN: &str = "\x1b[32m";
     const RED: &str = "\x1b[31m";
     const CYAN: &str = "\x1b[36m";
-    const YELLOW: &str = "\x1b[33m";
-
     let http_client = reqwest::Client::new();
     let client_id = config.client_id.clone();
 

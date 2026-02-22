@@ -338,7 +338,7 @@ fn encrypt_aes_gcm(plaintext: &str, key: &[u8; 32], aad: &[u8]) -> Result<String
     // Generate random 12-byte nonce
     let mut iv_bytes = [0u8; 12];
     getrandom::getrandom(&mut iv_bytes).map_err(|e| format!("RNG error: {}", e))?;
-    let nonce = Nonce::from_slice(&iv_bytes);
+    let nonce = Nonce::from(iv_bytes);
 
     let payload = aes_gcm::aead::Payload {
         msg: plaintext.as_bytes(),
@@ -346,7 +346,7 @@ fn encrypt_aes_gcm(plaintext: &str, key: &[u8; 32], aad: &[u8]) -> Result<String
     };
 
     let ciphertext_with_tag = cipher
-        .encrypt(nonce, payload)
+        .encrypt(&nonce, payload)
         .map_err(|e| format!("Encryption failed: {}", e))?;
 
     // Assemble: IV(12) || ciphertext || tag(16)
@@ -367,14 +367,14 @@ fn decrypt_aes_gcm(ciphertext_b64: &str, key: &[u8; 32], aad: &[u8]) -> Result<S
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| format!("AES key error: {}", e))?;
 
-    let nonce = Nonce::from_slice(&encrypted[..12]);
+    let nonce = Nonce::from(<[u8; 12]>::try_from(&encrypted[..12]).unwrap());
     let payload = aes_gcm::aead::Payload {
         msg: &encrypted[12..],
         aad,
     };
 
     let plaintext = cipher
-        .decrypt(nonce, payload)
+        .decrypt(&nonce, payload)
         .map_err(|e| format!("Decryption failed: {}", e))?;
 
     String::from_utf8(plaintext).map_err(|e| format!("Invalid UTF-8: {}", e))
@@ -396,10 +396,10 @@ fn encrypt_session_key_for_storage(session_key: &[u8; 32]) -> Result<String, Str
     // Generate random 12-byte nonce
     let mut iv_bytes = [0u8; 12];
     getrandom::getrandom(&mut iv_bytes).map_err(|e| format!("RNG error: {}", e))?;
-    let nonce = Nonce::from_slice(&iv_bytes);
+    let nonce = Nonce::from(iv_bytes);
 
     let ciphertext_with_tag = cipher
-        .encrypt(nonce, session_key.as_ref())
+        .encrypt(&nonce, session_key.as_ref())
         .map_err(|e| format!("Storage encryption failed: {}", e))?;
 
     // Assemble: IV(12) || ciphertext || tag(16)
@@ -420,9 +420,9 @@ fn decrypt_session_key_from_storage(ciphertext_b64: &str) -> Result<[u8; 32], St
     let cipher = Aes256Gcm::new_from_slice(&WASM_STORAGE_KEY)
         .map_err(|e| format!("Storage key error: {}", e))?;
 
-    let nonce = Nonce::from_slice(&encrypted[..12]);
+    let nonce = Nonce::from(<[u8; 12]>::try_from(&encrypted[..12]).unwrap());
     let plaintext = cipher
-        .decrypt(nonce, &encrypted[12..])
+        .decrypt(&nonce, &encrypted[12..])
         .map_err(|e| format!("Storage decryption failed: {}", e))?;
 
     if plaintext.len() != 32 {
@@ -518,9 +518,9 @@ async fn http_post(url: &str, body: &str, headers: &[(String, String)]) -> Resul
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
 
-    let mut opts = web_sys::RequestInit::new();
-    opts.method("POST");
-    opts.body(Some(&JsValue::from_str(body)));
+    let opts = web_sys::RequestInit::new();
+    opts.set_method("POST");
+    opts.set_body(&JsValue::from_str(body));
 
     let request = web_sys::Request::new_with_str_and_init(url, &opts)?;
     let headers_obj = request.headers();
