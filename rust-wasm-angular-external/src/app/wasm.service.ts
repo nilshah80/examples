@@ -48,34 +48,8 @@ export class WasmService {
     return this.wasmModule.get_client_id();
   }
 
-  getClientSecret(): string {
-    return this.wasmModule.get_client_secret();
-  }
-
   getSubject(): string {
     return this.wasmModule.get_subject();
-  }
-
-  generateNonce(): string {
-    return this.wasmModule.generate_nonce();
-  }
-
-  computeHmacSignature(
-    method: string,
-    path: string,
-    timestamp: string,
-    nonce: string,
-    body: string,
-    secret: string
-  ): string {
-    return this.wasmModule.compute_hmac_signature(
-      method,
-      path,
-      timestamp,
-      nonce,
-      body,
-      secret
-    );
   }
 
   async initSession(

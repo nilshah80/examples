@@ -1,22 +1,18 @@
 import init, {
   init_session,
   SessionContext,
-  generate_nonce,
-  compute_hmac_signature,
   get_sidecar_url,
   get_client_id,
-  get_client_secret,
   get_subject
 } from './pkg/rust_wasm_external.js';
 
 // Initialize WASM and load configuration from build-time env
 await init();
 
-// Configuration loaded from WASM (injected at build time)
+// Note: clientSecret is NOT exposed to JS — it stays inside WASM
 const CONFIG = {
   sidecarUrl: get_sidecar_url(),
   clientId: get_client_id(),
-  clientSecret: get_client_secret(),
   subject: get_subject(),
 };
 
@@ -37,32 +33,32 @@ const STEPS = [
   {
     n: 2,
     title: 'Token Issue (HMAC + GCM)',
-    desc: 'WASM computes HMAC-SHA256 signature over plaintext body, then encrypts with AES-256-GCM. Issues access + refresh tokens.',
+    desc: 'WASM computes HMAC-SHA256 signature, encrypts request, makes HTTP call, decrypts response, and stores tokens encrypted — all inside WASM.',
     endpoint: 'POST /api/v1/token/issue'
   },
   {
     n: 3,
     title: 'Token Introspection (Bearer + GCM)',
-    desc: 'Verify the issued token is active. WASM handles all encryption/decryption.',
+    desc: 'WASM loads access token from encrypted storage, builds request, and handles full encrypt/HTTP/decrypt cycle internally.',
     endpoint: 'POST /api/v1/introspect'
   },
   {
     n: 4,
     title: 'Session Refresh (Authenticated)',
-    desc: 'Create new authenticated session. Old session key is replaced with new encrypted key.',
+    desc: 'WASM loads access token from encrypted storage, performs authenticated ECDH, migrates tokens to new session key.',
     endpoint: 'POST /api/v1/session/init',
     session: true
   },
   {
     n: 5,
     title: 'Token Refresh (Bearer + GCM)',
-    desc: 'Rotate tokens using refresh token. Uses authenticated session.',
+    desc: 'WASM loads tokens from encrypted storage, rotates them via sidecar, re-encrypts new tokens in storage.',
     endpoint: 'POST /api/v1/token'
   },
   {
     n: 6,
     title: 'Token Revocation (Bearer + GCM)',
-    desc: 'Revoke refresh token (entire family). Clears encrypted session from storage.',
+    desc: 'WASM loads tokens, revokes via sidecar, clears all encrypted data from sessionStorage.',
     endpoint: 'POST /api/v1/revoke'
   },
 ];
@@ -72,8 +68,6 @@ let state = {
   loading: {},
   results: {},
   session: null,
-  accessToken: null,
-  refreshToken: null,
 };
 
 async function runStep(n) {
@@ -83,24 +77,12 @@ async function runStep(n) {
   try {
     let result;
     switch (n) {
-      case 1:
-        result = await step1();
-        break;
-      case 2:
-        result = await step2();
-        break;
-      case 3:
-        result = await step3();
-        break;
-      case 4:
-        result = await step4();
-        break;
-      case 5:
-        result = await step5();
-        break;
-      case 6:
-        result = await step6();
-        break;
+      case 1: result = await step1(); break;
+      case 2: result = await step2(); break;
+      case 3: result = await step3(); break;
+      case 4: result = await step4(); break;
+      case 5: result = await step5(); break;
+      case 6: result = await step6(); break;
     }
 
     state.results[n] = result;
@@ -120,14 +102,7 @@ async function runStep(n) {
 
 async function step1() {
   const start = Date.now();
-  state.session = await init_session(
-    CONFIG.sidecarUrl,
-    CONFIG.clientId,
-    null,
-    null
-  );
-
-  // Save encrypted session to storage
+  state.session = await init_session(CONFIG.sidecarUrl, CONFIG.clientId, null, null);
   state.session.save_to_storage();
 
   return {
@@ -145,12 +120,6 @@ async function step2() {
   if (!state.session) throw new Error('Run step 1 first');
 
   const start = Date.now();
-  const timestamp = Date.now().toString();
-  const nonce = generate_nonce();
-
-  // Order fields alphabetically to match Rust's serde_json serialization
-  // Top-level: audience, custom_claims, include_refresh_token, scope, single_session, subject
-  // Nested custom_claims: partner_id, region (alphabetical)
   const requestBody = {
     audience: 'orders-api',
     custom_claims: { partner_id: 'PARTNER-001', region: 'us-east-1' },
@@ -160,128 +129,44 @@ async function step2() {
     subject: CONFIG.subject
   };
 
-  const plaintext = JSON.stringify(requestBody);
-
-  // Compute HMAC-SHA256 signature over PLAINTEXT body (before encryption)
-  const signature = compute_hmac_signature(
-    'POST',
-    '/api/v1/token/issue',
-    timestamp,
-    nonce,
-    plaintext,
-    CONFIG.clientSecret
-  );
-
-  const encrypted = state.session.encrypt(plaintext, timestamp, nonce);
-
-  const requestHeaders = {
-    'Content-Type': 'application/json',
-    'X-ClientId': CONFIG.clientId,
-    'X-Idempotency-Key': `${timestamp}.${nonce}`,
-    'X-Kid': state.session.kid,
-    'X-Signature': signature  // HMAC signature (External Client)
-  };
-
-  const response = await fetch(`${CONFIG.sidecarUrl}/api/v1/token/issue`, {
-    method: 'POST',
-    headers: requestHeaders,
-    body: JSON.stringify({ payload: encrypted })
-  });
-
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-  const responseHeaders = {
-    'x-kid': response.headers.get('x-kid'),
-    'x-idempotency-key': response.headers.get('x-idempotency-key'),
-    'content-type': response.headers.get('content-type')
-  };
-
-  const respIdempKey = response.headers.get('X-Idempotency-Key');
-  const [respTimestamp, respNonce] = respIdempKey.split('.');
-  const data = await response.json();
-  const decrypted = state.session.decrypt(data.payload, respTimestamp, respNonce);
-  const tokens = JSON.parse(decrypted);
-
-  state.accessToken = tokens.access_token;
-  state.refreshToken = tokens.refresh_token;
+  const resultJson = await state.session.issue_token(JSON.stringify(requestBody));
+  const result = JSON.parse(resultJson);
 
   return {
     success: true,
     durationMs: Date.now() - start,
-    requestHeaders: requestHeaders,
-    requestBodyPlaintext: plaintext,
-    requestBodyEncrypted: encrypted,
-    responseHeaders: responseHeaders,
-    responseBodyEncrypted: data.payload,
-    responseBodyDecrypted: decrypted
+    requestHeaders: result.requestHeaders,
+    requestBodyPlaintext: result.requestBodyPlaintext,
+    requestBodyEncrypted: result.requestBodyEncrypted,
+    responseHeaders: result.responseHeaders,
+    responseBodyEncrypted: result.responseBodyEncrypted,
+    responseBodyDecrypted: result.responseBodyDecrypted,
+    storageNote: '✅ Tokens encrypted and stored in sessionStorage (never exposed to JS)'
   };
 }
 
 async function step3() {
-  if (!state.session || !state.accessToken) throw new Error('Run steps 1-2 first');
-
+  if (!state.session) throw new Error('Run steps 1-2 first');
   const start = Date.now();
-  const timestamp = Date.now().toString();
-  const nonce = generate_nonce();
-
-  const requestBody = { token: state.accessToken };
-  const plaintext = JSON.stringify(requestBody);
-  const encrypted = state.session.encrypt(plaintext, timestamp, nonce);
-
-  const requestHeaders = {
-    'Content-Type': 'application/json',
-    'X-ClientId': CONFIG.clientId,
-    'X-Idempotency-Key': `${timestamp}.${nonce}`,
-    'X-Kid': state.session.kid,
-    'Authorization': `Bearer ${state.accessToken}`
-  };
-
-  const response = await fetch(`${CONFIG.sidecarUrl}/api/v1/introspect`, {
-    method: 'POST',
-    headers: requestHeaders,
-    body: JSON.stringify({ payload: encrypted })
-  });
-
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-  const responseHeaders = {
-    'x-kid': response.headers.get('x-kid'),
-    'x-idempotency-key': response.headers.get('x-idempotency-key'),
-    'content-type': response.headers.get('content-type')
-  };
-
-  const respIdempKey = response.headers.get('X-Idempotency-Key');
-  const [respTimestamp, respNonce] = respIdempKey.split('.');
-  const data = await response.json();
-  const decrypted = state.session.decrypt(data.payload, respTimestamp, respNonce);
+  const resultJson = await state.session.introspect_token();
+  const result = JSON.parse(resultJson);
 
   return {
     success: true,
     durationMs: Date.now() - start,
-    requestHeaders: requestHeaders,
-    requestBodyPlaintext: plaintext,
-    requestBodyEncrypted: encrypted,
-    responseHeaders: responseHeaders,
-    responseBodyEncrypted: data.payload,
-    responseBodyDecrypted: decrypted
+    requestHeaders: result.requestHeaders,
+    requestBodyPlaintext: result.requestBodyPlaintext,
+    requestBodyEncrypted: result.requestBodyEncrypted,
+    responseHeaders: result.responseHeaders,
+    responseBodyEncrypted: result.responseBodyEncrypted,
+    responseBodyDecrypted: result.responseBodyDecrypted
   };
 }
 
 async function step4() {
-  if (!state.session || !state.accessToken) throw new Error('Run steps 1-3 first');
-
+  if (!state.session) throw new Error('Run steps 1-3 first');
   const start = Date.now();
-
-  // Create new authenticated session (old session key is zeroized in WASM)
-  state.session = await init_session(
-    CONFIG.sidecarUrl,
-    CONFIG.clientId,
-    state.accessToken,
-    CONFIG.subject
-  );
-
-  // Save new encrypted session to storage
-  state.session.save_to_storage();
+  state.session = await state.session.refresh_session();
 
   return {
     success: true,
@@ -290,134 +175,52 @@ async function step4() {
     kid: state.session.kid,
     authenticated: state.session.authenticated,
     expiresInSec: state.session.expires_in_sec,
-    storageNote: '✅ Authenticated session established (old session key zeroized)'
+    storageNote: '✅ Authenticated session established, tokens migrated to new key'
   };
 }
 
 async function step5() {
-  if (!state.session || !state.refreshToken) throw new Error('Run steps 1-4 first');
-
+  if (!state.session) throw new Error('Run steps 1-4 first');
   const start = Date.now();
-  const timestamp = Date.now().toString();
-  const nonce = generate_nonce();
-
-  const requestBody = {
-    grant_type: 'refresh_token',
-    refresh_token: state.refreshToken
-  };
-  const plaintext = JSON.stringify(requestBody);
-  const encrypted = state.session.encrypt(plaintext, timestamp, nonce);
-
-  const requestHeaders = {
-    'Content-Type': 'application/json',
-    'X-ClientId': CONFIG.clientId,
-    'X-Idempotency-Key': `${timestamp}.${nonce}`,
-    'X-Kid': state.session.kid,
-    'Authorization': `Bearer ${state.accessToken}`
-  };
-
-  const response = await fetch(`${CONFIG.sidecarUrl}/api/v1/token`, {
-    method: 'POST',
-    headers: requestHeaders,
-    body: JSON.stringify({ payload: encrypted })
-  });
-
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-  const responseHeaders = {
-    'x-kid': response.headers.get('x-kid'),
-    'x-idempotency-key': response.headers.get('x-idempotency-key'),
-    'content-type': response.headers.get('content-type')
-  };
-
-  const respIdempKey = response.headers.get('X-Idempotency-Key');
-  const [respTimestamp, respNonce] = respIdempKey.split('.');
-  const data = await response.json();
-  const decrypted = state.session.decrypt(data.payload, respTimestamp, respNonce);
-  const tokens = JSON.parse(decrypted);
-
-  state.accessToken = tokens.access_token;
-  state.refreshToken = tokens.refresh_token;
+  const resultJson = await state.session.refresh_tokens();
+  const result = JSON.parse(resultJson);
 
   return {
     success: true,
     durationMs: Date.now() - start,
-    requestHeaders: requestHeaders,
-    requestBodyPlaintext: plaintext,
-    requestBodyEncrypted: encrypted,
-    responseHeaders: responseHeaders,
-    responseBodyEncrypted: data.payload,
-    responseBodyDecrypted: decrypted
+    requestHeaders: result.requestHeaders,
+    requestBodyPlaintext: result.requestBodyPlaintext,
+    requestBodyEncrypted: result.requestBodyEncrypted,
+    responseHeaders: result.responseHeaders,
+    responseBodyEncrypted: result.responseBodyEncrypted,
+    responseBodyDecrypted: result.responseBodyDecrypted,
+    storageNote: '✅ Tokens rotated and re-encrypted in sessionStorage'
   };
 }
 
 async function step6() {
-  if (!state.session || !state.refreshToken) throw new Error('Run steps 1-5 first');
-
+  if (!state.session) throw new Error('Run steps 1-5 first');
   const start = Date.now();
-  const timestamp = Date.now().toString();
-  const nonce = generate_nonce();
-
-  const requestBody = {
-    token: state.refreshToken,
-    token_type_hint: 'refresh_token'
-  };
-  const plaintext = JSON.stringify(requestBody);
-  const encrypted = state.session.encrypt(plaintext, timestamp, nonce);
-
-  const requestHeaders = {
-    'Content-Type': 'application/json',
-    'X-ClientId': CONFIG.clientId,
-    'X-Idempotency-Key': `${timestamp}.${nonce}`,
-    'X-Kid': state.session.kid,
-    'Authorization': `Bearer ${state.accessToken}`
-  };
-
-  const response = await fetch(`${CONFIG.sidecarUrl}/api/v1/revoke`, {
-    method: 'POST',
-    headers: requestHeaders,
-    body: JSON.stringify({ payload: encrypted })
-  });
-
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-  const responseHeaders = {
-    'x-kid': response.headers.get('x-kid'),
-    'x-idempotency-key': response.headers.get('x-idempotency-key'),
-    'content-type': response.headers.get('content-type')
-  };
-
-  const respIdempKey = response.headers.get('X-Idempotency-Key');
-  const [respTimestamp, respNonce] = respIdempKey.split('.');
-  const data = await response.json();
-  const decrypted = state.session.decrypt(data.payload, respTimestamp, respNonce);
-
-  // Clear encrypted session from storage
-  SessionContext.clear_storage();
+  const resultJson = await state.session.revoke_tokens();
+  const result = JSON.parse(resultJson);
+  state.session = null;
 
   return {
     success: true,
     durationMs: Date.now() - start,
-    requestHeaders: requestHeaders,
-    requestBodyPlaintext: plaintext,
-    requestBodyEncrypted: encrypted,
-    responseHeaders: responseHeaders,
-    responseBodyEncrypted: data.payload,
-    responseBodyDecrypted: decrypted,
-    storageNote: '✅ Token revoked, session cleared from sessionStorage'
+    requestHeaders: result.requestHeaders,
+    requestBodyPlaintext: result.requestBodyPlaintext,
+    requestBodyEncrypted: result.requestBodyEncrypted,
+    responseHeaders: result.responseHeaders,
+    responseBodyEncrypted: result.responseBodyEncrypted,
+    responseBodyDecrypted: result.responseBodyDecrypted,
+    storageNote: '✅ Token revoked, session and tokens cleared from sessionStorage'
   };
 }
 
 async function resetAll() {
   SessionContext.clear_storage();
-  state = {
-    currentStep: 1,
-    loading: {},
-    results: {},
-    session: null,
-    accessToken: null,
-    refreshToken: null,
-  };
+  state = { currentStep: 1, loading: {}, results: {}, session: null };
   render();
 }
 
@@ -456,7 +259,6 @@ function render() {
     </div>
   `;
   html += '</div>';
-
   app.innerHTML = html;
 }
 
@@ -511,11 +313,7 @@ function renderResult(r) {
 }
 
 function formatJson(str) {
-  try {
-    return JSON.stringify(JSON.parse(str), null, 2);
-  } catch (e) {
-    return str;
-  }
+  try { return JSON.stringify(JSON.parse(str), null, 2); } catch (e) { return str; }
 }
 
 function truncate(str, maxLen) {
@@ -529,9 +327,6 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
-// Expose functions to window
 window.runStep = runStep;
 window.resetAll = resetAll;
-
-// Render (WASM already initialized at top)
 render();

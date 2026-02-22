@@ -9,6 +9,7 @@ use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use p256::{EncodedPoint, PublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::collections::BTreeMap;
 use wasm_bindgen::prelude::*;
 use web_sys::{window, Storage};
 
@@ -51,6 +52,33 @@ const WASM_STATIC_SECRET: [u8; 32] = [
     0x83, 0xa4, 0x5d, 0x19, 0xf7, 0x2b, 0x68, 0x9a,
     0x3e, 0xd1, 0x4f, 0x86, 0x5c, 0x20, 0x97, 0xb5,
 ];
+
+// ═══════════════════════════════════════════════════════════════════════════
+// API CALL RESULT — returned to JS as JSON string
+// Tokens are masked as [PROTECTED_IN_WASM] in all displayed fields
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiCallResult {
+    request_headers: BTreeMap<String, String>,
+    request_body_plaintext: String,
+    request_body_encrypted: String,
+    response_headers: BTreeMap<String, String>,
+    response_body_encrypted: String,
+    response_body_decrypted: String,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HTTP RESPONSE — internal struct for fetch results with headers
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct HttpResponseWithHeaders {
+    body: String,
+    idempotency_key: String,
+    kid: String,
+    content_type: String,
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // WASM BINDINGS - Configuration Getters
@@ -137,17 +165,14 @@ impl SessionContext {
     }
 
     /// Save encrypted session key to sessionStorage
-    /// The session key is encrypted with a per-session derived key before storing
     #[wasm_bindgen]
     pub fn save_to_storage(&self) -> Result<(), JsValue> {
         let storage = get_session_storage()?;
 
-        // Encrypt session key with per-session derived storage key
         let encrypted_session_key =
             encrypt_session_key_for_storage(&self.session_key, &self.session_id, &self.client_id)
                 .map_err(|e| JsValue::from_str(&e))?;
 
-        // Store metadata and encrypted session key
         storage.set_item("session_id", &self.session_id)?;
         storage.set_item("encrypted_session_key", &encrypted_session_key)?;
         storage.set_item("kid", &self.kid)?;
@@ -181,7 +206,6 @@ impl SessionContext {
             .parse::<i64>()
             .map_err(|_| JsValue::from_str("Invalid expires_in_sec value"))?;
 
-        // Decrypt session key using per-session derived storage key
         let session_key =
             decrypt_session_key_from_storage(&encrypted_session_key, &session_id, &client_id)
                 .map_err(|e| JsValue::from_str(&e))?;
@@ -198,7 +222,7 @@ impl SessionContext {
         })
     }
 
-    /// Clear session from storage
+    /// Clear session and tokens from storage
     #[wasm_bindgen]
     pub fn clear_storage() -> Result<(), JsValue> {
         let storage = get_session_storage()?;
@@ -208,8 +232,339 @@ impl SessionContext {
         storage.remove_item("client_id")?;
         storage.remove_item("authenticated")?;
         storage.remove_item("expires_in_sec")?;
-        log("Session cleared from storage");
+        storage.remove_item("encrypted_access_token")?;
+        storage.remove_item("encrypted_refresh_token")?;
+        log("Session and tokens cleared from storage");
         Ok(())
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // HIGH-LEVEL API METHODS
+    // These handle the complete encrypt → HTTP → decrypt → store lifecycle
+    // Tokens never leave WASM memory; JS only sees masked values
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Step 2: Issue tokens via sidecar (Basic Auth + AES-256-GCM)
+    /// Tokens are stored encrypted in sessionStorage — never returned to JS
+    #[wasm_bindgen]
+    pub async fn issue_token(&self, request_body_json: &str) -> Result<String, JsValue> {
+        let timestamp = (js_sys::Date::new_0().get_time() as u64).to_string();
+        let nonce = uuid::Uuid::new_v4().to_string();
+
+        // Encrypt request body
+        let aad = build_aad(&timestamp, &nonce, &self.kid, &self.client_id);
+        let encrypted = encrypt_aes_gcm(request_body_json, &self.session_key, &aad)
+            .map_err(|e| JsValue::from_str(&e))?;
+
+        // Build request headers — Authorization from WASM constants (never exposed to JS)
+        let mut request_headers = BTreeMap::new();
+        request_headers.insert("Content-Type".to_string(), "application/json".to_string());
+        request_headers.insert("X-ClientId".to_string(), self.client_id.clone());
+        request_headers.insert("X-Idempotency-Key".to_string(), format!("{}.{}", timestamp, nonce));
+        request_headers.insert("X-Kid".to_string(), self.kid.clone());
+        request_headers.insert("Authorization".to_string(),
+            format!("Basic {}", B64.encode(format!("{}:{}", CLIENT_ID, CLIENT_SECRET))));
+
+        let headers: Vec<(String, String)> = request_headers.iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        // HTTP POST
+        let url = format!("{}/api/v1/token/issue", SIDECAR_URL);
+        let http_body = serde_json::json!({ "payload": encrypted }).to_string();
+        let resp = http_post_with_headers(&url, &http_body, &headers).await?;
+
+        // Parse and decrypt response
+        let resp_body: serde_json::Value = serde_json::from_str(&resp.body)
+            .map_err(|e| JsValue::from_str(&format!("JSON parse error: {}", e)))?;
+        let encrypted_response = resp_body["payload"].as_str()
+            .ok_or_else(|| JsValue::from_str("No payload in response"))?;
+
+        let (resp_ts, resp_nonce) = parse_idempotency_key(&resp.idempotency_key)?;
+        let resp_aad = build_aad(&resp_ts, &resp_nonce, &self.kid, &self.client_id);
+        let decrypted = decrypt_aes_gcm(encrypted_response, &self.session_key, &resp_aad)
+            .map_err(|e| JsValue::from_str(&e))?;
+
+        // Extract tokens and store encrypted — tokens never leave WASM
+        let tokens: serde_json::Value = serde_json::from_str(&decrypted)
+            .map_err(|e| JsValue::from_str(&format!("Token parse error: {}", e)))?;
+        if let Some(at) = tokens["access_token"].as_str() {
+            store_token_to_storage("encrypted_access_token", at, &self.session_id, &self.client_id)?;
+        }
+        if let Some(rt) = tokens["refresh_token"].as_str() {
+            store_token_to_storage("encrypted_refresh_token", rt, &self.session_id, &self.client_id)?;
+        }
+
+        log("Tokens issued and stored encrypted in sessionStorage");
+
+        // Mask sensitive values for UI display
+        let mut display_headers = request_headers;
+        display_headers.insert("Authorization".to_string(), "Basic [PROTECTED_IN_WASM]".to_string());
+
+        let mut response_headers = BTreeMap::new();
+        response_headers.insert("x-kid".to_string(), resp.kid);
+        response_headers.insert("x-idempotency-key".to_string(), resp.idempotency_key);
+        response_headers.insert("content-type".to_string(), resp.content_type);
+
+        let result = ApiCallResult {
+            request_headers: display_headers,
+            request_body_plaintext: request_body_json.to_string(),
+            request_body_encrypted: encrypted,
+            response_headers,
+            response_body_encrypted: encrypted_response.to_string(),
+            response_body_decrypted: mask_tokens_in_json(&decrypted),
+        };
+
+        serde_json::to_string(&result)
+            .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+    }
+
+    /// Step 3: Introspect token (Bearer + AES-256-GCM)
+    /// Access token loaded from encrypted storage — never touches JS
+    #[wasm_bindgen]
+    pub async fn introspect_token(&self) -> Result<String, JsValue> {
+        let access_token = load_token_from_storage(
+            "encrypted_access_token", &self.session_id, &self.client_id)?;
+
+        let timestamp = (js_sys::Date::new_0().get_time() as u64).to_string();
+        let nonce = uuid::Uuid::new_v4().to_string();
+
+        let request_body = serde_json::json!({ "token": access_token }).to_string();
+        let aad = build_aad(&timestamp, &nonce, &self.kid, &self.client_id);
+        let encrypted = encrypt_aes_gcm(&request_body, &self.session_key, &aad)
+            .map_err(|e| JsValue::from_str(&e))?;
+
+        let mut request_headers = BTreeMap::new();
+        request_headers.insert("Content-Type".to_string(), "application/json".to_string());
+        request_headers.insert("X-ClientId".to_string(), self.client_id.clone());
+        request_headers.insert("X-Idempotency-Key".to_string(), format!("{}.{}", timestamp, nonce));
+        request_headers.insert("X-Kid".to_string(), self.kid.clone());
+        request_headers.insert("Authorization".to_string(), format!("Bearer {}", access_token));
+
+        let headers: Vec<(String, String)> = request_headers.iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let url = format!("{}/api/v1/introspect", SIDECAR_URL);
+        let http_body = serde_json::json!({ "payload": encrypted }).to_string();
+        let resp = http_post_with_headers(&url, &http_body, &headers).await?;
+
+        let resp_body: serde_json::Value = serde_json::from_str(&resp.body)
+            .map_err(|e| JsValue::from_str(&format!("JSON parse error: {}", e)))?;
+        let encrypted_response = resp_body["payload"].as_str()
+            .ok_or_else(|| JsValue::from_str("No payload in response"))?;
+
+        let (resp_ts, resp_nonce) = parse_idempotency_key(&resp.idempotency_key)?;
+        let resp_aad = build_aad(&resp_ts, &resp_nonce, &self.kid, &self.client_id);
+        let decrypted = decrypt_aes_gcm(encrypted_response, &self.session_key, &resp_aad)
+            .map_err(|e| JsValue::from_str(&e))?;
+
+        log("Token introspection completed");
+
+        // Mask tokens in display
+        let mut display_headers = request_headers;
+        display_headers.insert("Authorization".to_string(), "Bearer [PROTECTED_IN_WASM]".to_string());
+
+        let mut response_headers = BTreeMap::new();
+        response_headers.insert("x-kid".to_string(), resp.kid);
+        response_headers.insert("x-idempotency-key".to_string(), resp.idempotency_key);
+        response_headers.insert("content-type".to_string(), resp.content_type);
+
+        let result = ApiCallResult {
+            request_headers: display_headers,
+            request_body_plaintext: mask_tokens_in_json(&request_body),
+            request_body_encrypted: encrypted,
+            response_headers,
+            response_body_encrypted: encrypted_response.to_string(),
+            response_body_decrypted: decrypted,
+        };
+
+        serde_json::to_string(&result)
+            .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+    }
+
+    /// Step 4: Refresh session with authenticated ECDH
+    /// Loads access_token from encrypted storage, creates new session,
+    /// migrates encrypted tokens to new session's derived key
+    #[wasm_bindgen]
+    pub async fn refresh_session(&self) -> Result<SessionContext, JsValue> {
+        // Load tokens from encrypted storage using current session's key
+        let access_token = load_token_from_storage(
+            "encrypted_access_token", &self.session_id, &self.client_id)?;
+        let refresh_token = load_token_from_storage(
+            "encrypted_refresh_token", &self.session_id, &self.client_id)?;
+
+        // Perform authenticated ECDH to get new session
+        let new_ctx = do_session_init(
+            SIDECAR_URL,
+            &self.client_id,
+            Some(access_token.clone()),
+            Some(SUBJECT.to_string()),
+        ).await?;
+
+        // Save new session to storage
+        new_ctx.save_to_storage()?;
+
+        // Re-encrypt tokens with new session's derived key
+        store_token_to_storage(
+            "encrypted_access_token", &access_token, &new_ctx.session_id, &new_ctx.client_id)?;
+        store_token_to_storage(
+            "encrypted_refresh_token", &refresh_token, &new_ctx.session_id, &new_ctx.client_id)?;
+
+        log("Session refreshed, tokens migrated to new session key");
+        Ok(new_ctx)
+    }
+
+    /// Step 5: Refresh tokens (Bearer + AES-256-GCM)
+    /// Both tokens loaded from encrypted storage, updated tokens re-encrypted
+    #[wasm_bindgen]
+    pub async fn refresh_tokens(&self) -> Result<String, JsValue> {
+        let access_token = load_token_from_storage(
+            "encrypted_access_token", &self.session_id, &self.client_id)?;
+        let refresh_token = load_token_from_storage(
+            "encrypted_refresh_token", &self.session_id, &self.client_id)?;
+
+        let timestamp = (js_sys::Date::new_0().get_time() as u64).to_string();
+        let nonce = uuid::Uuid::new_v4().to_string();
+
+        let request_body = serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token
+        }).to_string();
+        let aad = build_aad(&timestamp, &nonce, &self.kid, &self.client_id);
+        let encrypted = encrypt_aes_gcm(&request_body, &self.session_key, &aad)
+            .map_err(|e| JsValue::from_str(&e))?;
+
+        let mut request_headers = BTreeMap::new();
+        request_headers.insert("Content-Type".to_string(), "application/json".to_string());
+        request_headers.insert("X-ClientId".to_string(), self.client_id.clone());
+        request_headers.insert("X-Idempotency-Key".to_string(), format!("{}.{}", timestamp, nonce));
+        request_headers.insert("X-Kid".to_string(), self.kid.clone());
+        request_headers.insert("Authorization".to_string(), format!("Bearer {}", access_token));
+
+        let headers: Vec<(String, String)> = request_headers.iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let url = format!("{}/api/v1/token", SIDECAR_URL);
+        let http_body = serde_json::json!({ "payload": encrypted }).to_string();
+        let resp = http_post_with_headers(&url, &http_body, &headers).await?;
+
+        let resp_body: serde_json::Value = serde_json::from_str(&resp.body)
+            .map_err(|e| JsValue::from_str(&format!("JSON parse error: {}", e)))?;
+        let encrypted_response = resp_body["payload"].as_str()
+            .ok_or_else(|| JsValue::from_str("No payload in response"))?;
+
+        let (resp_ts, resp_nonce) = parse_idempotency_key(&resp.idempotency_key)?;
+        let resp_aad = build_aad(&resp_ts, &resp_nonce, &self.kid, &self.client_id);
+        let decrypted = decrypt_aes_gcm(encrypted_response, &self.session_key, &resp_aad)
+            .map_err(|e| JsValue::from_str(&e))?;
+
+        // Update stored tokens
+        let tokens: serde_json::Value = serde_json::from_str(&decrypted)
+            .map_err(|e| JsValue::from_str(&format!("Token parse error: {}", e)))?;
+        if let Some(at) = tokens["access_token"].as_str() {
+            store_token_to_storage("encrypted_access_token", at, &self.session_id, &self.client_id)?;
+        }
+        if let Some(rt) = tokens["refresh_token"].as_str() {
+            store_token_to_storage("encrypted_refresh_token", rt, &self.session_id, &self.client_id)?;
+        }
+
+        log("Tokens refreshed and re-encrypted in sessionStorage");
+
+        let mut display_headers = request_headers;
+        display_headers.insert("Authorization".to_string(), "Bearer [PROTECTED_IN_WASM]".to_string());
+
+        let mut response_headers = BTreeMap::new();
+        response_headers.insert("x-kid".to_string(), resp.kid);
+        response_headers.insert("x-idempotency-key".to_string(), resp.idempotency_key);
+        response_headers.insert("content-type".to_string(), resp.content_type);
+
+        let result = ApiCallResult {
+            request_headers: display_headers,
+            request_body_plaintext: mask_tokens_in_json(&request_body),
+            request_body_encrypted: encrypted,
+            response_headers,
+            response_body_encrypted: encrypted_response.to_string(),
+            response_body_decrypted: mask_tokens_in_json(&decrypted),
+        };
+
+        serde_json::to_string(&result)
+            .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+    }
+
+    /// Step 6: Revoke tokens (Bearer + AES-256-GCM)
+    /// Tokens loaded from encrypted storage, all storage cleared after revocation
+    #[wasm_bindgen]
+    pub async fn revoke_tokens(&self) -> Result<String, JsValue> {
+        let access_token = load_token_from_storage(
+            "encrypted_access_token", &self.session_id, &self.client_id)?;
+        let refresh_token = load_token_from_storage(
+            "encrypted_refresh_token", &self.session_id, &self.client_id)?;
+
+        let timestamp = (js_sys::Date::new_0().get_time() as u64).to_string();
+        let nonce = uuid::Uuid::new_v4().to_string();
+
+        let request_body = serde_json::json!({
+            "token": refresh_token,
+            "token_type_hint": "refresh_token"
+        }).to_string();
+        let aad = build_aad(&timestamp, &nonce, &self.kid, &self.client_id);
+        let encrypted = encrypt_aes_gcm(&request_body, &self.session_key, &aad)
+            .map_err(|e| JsValue::from_str(&e))?;
+
+        let mut request_headers = BTreeMap::new();
+        request_headers.insert("Content-Type".to_string(), "application/json".to_string());
+        request_headers.insert("X-ClientId".to_string(), self.client_id.clone());
+        request_headers.insert("X-Idempotency-Key".to_string(), format!("{}.{}", timestamp, nonce));
+        request_headers.insert("X-Kid".to_string(), self.kid.clone());
+        request_headers.insert("Authorization".to_string(), format!("Bearer {}", access_token));
+
+        let headers: Vec<(String, String)> = request_headers.iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let url = format!("{}/api/v1/revoke", SIDECAR_URL);
+        let http_body = serde_json::json!({ "payload": encrypted }).to_string();
+        let resp = http_post_with_headers(&url, &http_body, &headers).await?;
+
+        // Response may have empty payload for revocation
+        let resp_body: serde_json::Value = serde_json::from_str(&resp.body).unwrap_or_default();
+        let encrypted_response = resp_body.get("payload").and_then(|v| v.as_str());
+
+        let decrypted = if let Some(enc) = encrypted_response {
+            let (resp_ts, resp_nonce) = parse_idempotency_key(&resp.idempotency_key)?;
+            let resp_aad = build_aad(&resp_ts, &resp_nonce, &self.kid, &self.client_id);
+            decrypt_aes_gcm(enc, &self.session_key, &resp_aad)
+                .map_err(|e| JsValue::from_str(&e))?
+        } else {
+            "(empty)".to_string()
+        };
+
+        // Clear all session and token data from storage
+        SessionContext::clear_storage()?;
+
+        log("Tokens revoked, session and tokens cleared from storage");
+
+        let mut display_headers = request_headers;
+        display_headers.insert("Authorization".to_string(), "Bearer [PROTECTED_IN_WASM]".to_string());
+
+        let mut response_headers = BTreeMap::new();
+        response_headers.insert("x-kid".to_string(), resp.kid);
+        response_headers.insert("x-idempotency-key".to_string(), resp.idempotency_key);
+        response_headers.insert("content-type".to_string(), resp.content_type);
+
+        let result = ApiCallResult {
+            request_headers: display_headers,
+            request_body_plaintext: mask_tokens_in_json(&request_body),
+            request_body_encrypted: encrypted,
+            response_headers,
+            response_body_encrypted: encrypted_response.unwrap_or("").to_string(),
+            response_body_decrypted: decrypted,
+        };
+
+        serde_json::to_string(&result)
+            .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
     }
 }
 
@@ -231,10 +586,8 @@ struct SessionInitResponse {
     expires_in_sec: i64,
 }
 
-/// Initialize session with ECDH key exchange
-/// Returns session context ready for encryption/decryption
-#[wasm_bindgen]
-pub async fn init_session(
+/// Internal session init logic — called by both init_session (JS) and refresh_session
+async fn do_session_init(
     sidecar_url: &str,
     client_id: &str,
     access_token: Option<String>,
@@ -246,19 +599,16 @@ pub async fn init_session(
     let client_public_key_bytes = public_key.to_encoded_point(false);
     let client_public_key_b64 = B64.encode(client_public_key_bytes.as_bytes());
 
-    // Prepare request
     let req_body = SessionInitRequest {
         client_public_key: client_public_key_b64,
     };
     let req_json = serde_json::to_string(&req_body)
         .map_err(|e| JsValue::from_str(&format!("JSON error: {}", e)))?;
 
-    // Build headers
     let mut headers = Vec::new();
     headers.push(("Content-Type".to_string(), "application/json".to_string()));
     headers.push(("X-ClientId".to_string(), client_id.to_string()));
 
-    // Generate idempotency key
     let timestamp = js_sys::Date::new_0().get_time() as u64;
     let nonce = uuid::Uuid::new_v4().to_string();
     headers.push(("X-Idempotency-Key".to_string(), format!("{}.{}", timestamp, nonce)));
@@ -271,14 +621,13 @@ pub async fn init_session(
         headers.push(("X-Subject".to_string(), subj));
     }
 
-    // Call sidecar
     let url = format!("{}/api/v1/session/init", sidecar_url);
     let response = http_post(&url, &req_json, &headers).await?;
 
     let resp: SessionInitResponse = serde_json::from_str(&response)
         .map_err(|e| JsValue::from_str(&format!("JSON parse error: {}", e)))?;
 
-    // Compute shared secret
+    // Compute shared secret via ECDH
     let peer_bytes = B64.decode(&resp.server_public_key)
         .map_err(|e| JsValue::from_str(&format!("Base64 decode error: {}", e)))?;
     let peer_point = EncodedPoint::from_bytes(&peer_bytes)
@@ -289,13 +638,10 @@ pub async fn init_session(
     let mut shared_secret = [0u8; 32];
     shared_secret.copy_from_slice(shared.raw_secret_bytes());
 
-    // Derive session key via HKDF
     let session_key = derive_session_key(&mut shared_secret, &resp.session_id, client_id)
         .map_err(|e| JsValue::from_str(&e))?;
 
-    // kid = "session:" + session_id
     let kid = format!("session:{}", resp.session_id);
-
     let authenticated = has_access_token;
 
     Ok(SessionContext {
@@ -306,6 +652,17 @@ pub async fn init_session(
         authenticated,
         expires_in_sec: resp.expires_in_sec,
     })
+}
+
+/// Initialize session with ECDH key exchange (JS entry point)
+#[wasm_bindgen]
+pub async fn init_session(
+    sidecar_url: &str,
+    client_id: &str,
+    access_token: Option<String>,
+    subject: Option<String>,
+) -> Result<SessionContext, JsValue> {
+    do_session_init(sidecar_url, client_id, access_token, subject).await
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -325,9 +682,7 @@ fn derive_session_key(
     hk.expand(info.as_bytes(), &mut session_key)
         .map_err(|e| format!("HKDF expand failed: {}", e))?;
 
-    // Zeroize shared secret
     shared_secret.fill(0);
-
     Ok(session_key)
 }
 
@@ -335,7 +690,6 @@ fn encrypt_aes_gcm(plaintext: &str, key: &[u8; 32], aad: &[u8]) -> Result<String
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| format!("AES key error: {}", e))?;
 
-    // Generate random 12-byte nonce
     let mut iv_bytes = [0u8; 12];
     getrandom::getrandom(&mut iv_bytes).map_err(|e| format!("RNG error: {}", e))?;
     let nonce = Nonce::from(iv_bytes);
@@ -349,7 +703,6 @@ fn encrypt_aes_gcm(plaintext: &str, key: &[u8; 32], aad: &[u8]) -> Result<String
         .encrypt(&nonce, payload)
         .map_err(|e| format!("Encryption failed: {}", e))?;
 
-    // Assemble: IV(12) || ciphertext || tag(16)
     let mut result = Vec::with_capacity(12 + ciphertext_with_tag.len());
     result.extend_from_slice(&iv_bytes);
     result.extend_from_slice(&ciphertext_with_tag);
@@ -386,8 +739,6 @@ fn build_aad(timestamp: &str, nonce: &str, kid: &str, client_id: &str) -> Vec<u8
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SESSION KEY STORAGE ENCRYPTION
-// Derives a per-session storage key via HKDF(WASM_STATIC_SECRET, session_id)
-// then uses it to encrypt the session key before storing in browser
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn derive_storage_key(session_id: &str, client_id: &str) -> Result<[u8; 32], String> {
@@ -408,7 +759,6 @@ fn encrypt_session_key_for_storage(
     let cipher = Aes256Gcm::new_from_slice(&storage_key)
         .map_err(|e| format!("Storage key error: {}", e))?;
 
-    // Generate random 12-byte nonce
     let mut iv_bytes = [0u8; 12];
     getrandom::getrandom(&mut iv_bytes).map_err(|e| format!("RNG error: {}", e))?;
     let nonce = Nonce::from(iv_bytes);
@@ -417,7 +767,6 @@ fn encrypt_session_key_for_storage(
         .encrypt(&nonce, session_key.as_ref())
         .map_err(|e| format!("Storage encryption failed: {}", e))?;
 
-    // Assemble: IV(12) || ciphertext || tag(16)
     let mut result = Vec::with_capacity(12 + ciphertext_with_tag.len());
     result.extend_from_slice(&iv_bytes);
     result.extend_from_slice(&ciphertext_with_tag);
@@ -455,6 +804,41 @@ fn decrypt_session_key_from_storage(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// TOKEN STORAGE ENCRYPTION
+// Tokens are encrypted with the same per-session derived key used for
+// session key storage, with AAD to differentiate token types
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn store_token_to_storage(
+    key: &str,
+    token: &str,
+    session_id: &str,
+    client_id: &str,
+) -> Result<(), JsValue> {
+    let storage = get_session_storage()?;
+    let storage_key = derive_storage_key(session_id, client_id)
+        .map_err(|e| JsValue::from_str(&e))?;
+    let encrypted = encrypt_aes_gcm(token, &storage_key, key.as_bytes())
+        .map_err(|e| JsValue::from_str(&e))?;
+    storage.set_item(key, &encrypted)?;
+    Ok(())
+}
+
+fn load_token_from_storage(
+    key: &str,
+    session_id: &str,
+    client_id: &str,
+) -> Result<String, JsValue> {
+    let storage = get_session_storage()?;
+    let encrypted = storage.get_item(key)?
+        .ok_or_else(|| JsValue::from_str(&format!("No {} found — run previous steps first", key)))?;
+    let storage_key = derive_storage_key(session_id, client_id)
+        .map_err(|e| JsValue::from_str(&e))?;
+    decrypt_aes_gcm(&encrypted, &storage_key, key.as_bytes())
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // UTILITIES
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -482,7 +866,35 @@ pub fn generate_timestamp() -> String {
     date.to_iso_string().as_string().unwrap()
 }
 
-/// Simple HTTP POST using fetch API
+/// Mask token values in JSON for safe display to JS
+fn mask_tokens_in_json(json_str: &str) -> String {
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(json_str) {
+        if let Some(obj) = value.as_object_mut() {
+            for key in ["access_token", "refresh_token", "token"] {
+                if obj.contains_key(key) {
+                    obj.insert(
+                        key.to_string(),
+                        serde_json::Value::String("[PROTECTED_IN_WASM]".to_string()),
+                    );
+                }
+            }
+        }
+        serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string())
+    } else {
+        json_str.to_string()
+    }
+}
+
+/// Parse idempotency key "timestamp.nonce" into components
+fn parse_idempotency_key(key: &str) -> Result<(String, String), JsValue> {
+    let parts: Vec<&str> = key.splitn(2, '.').collect();
+    if parts.len() != 2 {
+        return Err(JsValue::from_str("Invalid idempotency key format"));
+    }
+    Ok((parts[0].to_string(), parts[1].to_string()))
+}
+
+/// Simple HTTP POST using fetch API (body-only response)
 async fn http_post(url: &str, body: &str, headers: &[(String, String)]) -> Result<String, JsValue> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
@@ -507,4 +919,47 @@ async fn http_post(url: &str, body: &str, headers: &[(String, String)]) -> Resul
 
     let text = JsFuture::from(resp.text()?).await?;
     Ok(text.as_string().unwrap_or_default())
+}
+
+/// HTTP POST with response headers (for API call methods)
+async fn http_post_with_headers(
+    url: &str,
+    body: &str,
+    headers: &[(String, String)],
+) -> Result<HttpResponseWithHeaders, JsValue> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+
+    let opts = web_sys::RequestInit::new();
+    opts.set_method("POST");
+    opts.set_body(&JsValue::from_str(body));
+
+    let request = web_sys::Request::new_with_str_and_init(url, &opts)?;
+    let headers_obj = request.headers();
+    for (k, v) in headers {
+        headers_obj.set(k, v)?;
+    }
+
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("No window"))?;
+    let resp_value = JsFuture::from(window.fetch_with_request(&request)).await?;
+    let resp: web_sys::Response = resp_value.dyn_into()?;
+
+    if !resp.ok() {
+        return Err(JsValue::from_str(&format!("HTTP {}", resp.status())));
+    }
+
+    let resp_headers = resp.headers();
+    let idempotency_key = resp_headers.get("X-Idempotency-Key")?.unwrap_or_default();
+    let kid = resp_headers.get("X-Kid")?.unwrap_or_default();
+    let content_type = resp_headers.get("Content-Type")?.unwrap_or_default();
+
+    let text = JsFuture::from(resp.text()?).await?;
+    let body_text = text.as_string().unwrap_or_default();
+
+    Ok(HttpResponseWithHeaders {
+        body: body_text,
+        idempotency_key,
+        kid,
+        content_type,
+    })
 }

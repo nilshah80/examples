@@ -8,10 +8,8 @@ declare global {
     accessToken?: string,
     subject?: string
   ): Promise<any>;
-  function generate_nonce(): string;
   function get_sidecar_url(): string;
   function get_client_id(): string;
-  function get_client_secret(): string;
   function get_subject(): string;
   class SessionContext {
     session_id: string;
@@ -20,6 +18,11 @@ declare global {
     expires_in_sec: number;
     encrypt(plaintext: string, timestamp: string, nonce: string): string;
     decrypt(ciphertext: string, timestamp: string, nonce: string): string;
+    issue_token(request_body_json: string): Promise<string>;
+    introspect_token(): Promise<string>;
+    refresh_session(): Promise<SessionContext>;
+    refresh_tokens(): Promise<string>;
+    revoke_tokens(): Promise<string>;
     save_to_storage(): void;
     static load_from_storage(): SessionContext;
     static clear_storage(): void;
@@ -38,19 +41,17 @@ export class WasmService {
     try {
       // Import the WASM module
       const wasmModule = await import('../assets/wasm/rust_wasm_angular_internal.js');
-      
+
       // Initialize with object parameter (new wasm-bindgen format)
       await wasmModule.default({ module_or_path: '/assets/wasm/rust_wasm_angular_internal_bg.wasm' });
-      
+
       // Copy functions to global scope
       (window as any).init_session = wasmModule.init_session;
-      (window as any).generate_nonce = wasmModule.generate_nonce;
       (window as any).get_sidecar_url = wasmModule.get_sidecar_url;
       (window as any).get_client_id = wasmModule.get_client_id;
-      (window as any).get_client_secret = wasmModule.get_client_secret;
       (window as any).get_subject = wasmModule.get_subject;
       (window as any).SessionContext = wasmModule.SessionContext;
-      
+
       this.wasmLoaded = true;
       console.log('✅ WASM module loaded successfully');
     } catch (error) {
@@ -67,16 +68,8 @@ export class WasmService {
     return (window as any).get_client_id();
   }
 
-  getClientSecret(): string {
-    return (window as any).get_client_secret();
-  }
-
   getSubject(): string {
     return (window as any).get_subject();
-  }
-
-  generateNonce(): string {
-    return (window as any).generate_nonce();
   }
 
   async initSession(
